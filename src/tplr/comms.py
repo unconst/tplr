@@ -17,7 +17,6 @@
 # fmt: off
 
 import os
-import boto3
 import time
 import torch
 import asyncio
@@ -30,19 +29,10 @@ from aiobotocore.session import get_session
 import tplr as tplr
 
 BUCKET = 'decis'
-S3 = boto3.client('s3')
 CLIENT_CONFIG = botocore.config.Config(max_pool_connections=256,)
 
-class Comms:
-    
-    def __init__(self, subtensor, metagraph):
-        ...
-        
-    def sync():
-        ...
-
 async def put(state_dict: dict, uid: str, window: int, key: str):
-    tplr.logger.info(f"PUT {uid}/{window}/{key} -->")
+    tplr.logger.debug(f"PUT {uid}/{window}/{key} -->")
     # Save the object to temp
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as temp_file:
         torch.save(state_dict, temp_file)
@@ -60,12 +50,12 @@ async def put(state_dict: dict, uid: str, window: int, key: str):
                 await s3_client.put_object(Bucket=BUCKET, Key=f"{uid}/{window}/{key}", Body=f)
     # Delete tmp file
     os.remove(temp_file_path)
-    tplr.logger.info(f"PUT {uid}/{window}/{key} <--")
+    tplr.logger.debug(f"PUT {uid}/{window}/{key} <--")
 
     
 async def get( uid: int, window: int, key: str, timeout: int = 30 ):
     full_key = f"{uid}/{window}/{key}"
-    tplr.logger.info(f"GET {full_key} -->")
+    tplr.logger.debug(f"GET {full_key} -->")
     try:
         # Create a temporary file to store the downloaded object
         with tempfile.NamedTemporaryFile(delete=True, suffix='.pt') as temp_file:
@@ -91,7 +81,7 @@ async def get( uid: int, window: int, key: str, timeout: int = 30 ):
             # Load the object into memory
             with open(temp_file_path, 'rb') as f:
                 state_dict = torch.load(f, weights_only=True)
-        tplr.logger.info(f"GET {full_key} <--")
+        tplr.logger.debug(f"GET {full_key} <--")
         return state_dict
     except asyncio.TimeoutError:
         tplr.logger.debug(f"Timeout occurred while downloading {full_key} from S3.")
@@ -112,7 +102,7 @@ async def get_with_retry(uid, window, key, timeout):
             return state_dict
         except Exception:
             if time.time() >= end_time:
-                tplr.logger.info(f"GET {uid}/{window}/{key} x (timeout), {time.time()} > {int(end_time)}")
+                tplr.logger.debug(f"GET {uid}/{window}/{key} x (timeout), {time.time()} > {int(end_time)}")
                 return None
             await asyncio.sleep(0.1)  # Wait before retrying
     
