@@ -24,10 +24,14 @@ import aiofiles
 import botocore
 import tempfile
 from typing import List, Dict
+from types import SimpleNamespace
 from aiobotocore.session import get_session
 
 import tplr as tplr
 
+# Load environment variables
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 BUCKET = 'decis'
 CLIENT_CONFIG = botocore.config.Config(max_pool_connections=256,)
 
@@ -43,8 +47,8 @@ async def put(state_dict: dict, uid: str, window: int, key: str):
         's3',
         region_name='us-east-1',
         config=CLIENT_CONFIG,
-        aws_access_key_id='AKIA3TN4TF2QTW6KVS6V',
-        aws_secret_access_key='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'
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
         ) as s3_client:
             with open(temp_file_path, "rb") as f:
                 await s3_client.put_object(Bucket=BUCKET, Key=f"{uid}/{window}/{key}", Body=f)
@@ -66,8 +70,8 @@ async def get( uid: int, window: int, key: str, timeout: int = 30 ):
                 's3',
                 region_name='us-east-1',
                 config=CLIENT_CONFIG,
-                aws_access_key_id='AKIA3TN4TF2QTW6KVS6V',
-                aws_secret_access_key='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'
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY
             ) as s3_client:
                 response = await asyncio.wait_for(
                     s3_client.get_object(Bucket=BUCKET, Key=f"{full_key}"),
@@ -111,41 +115,73 @@ async def gather(
     my_uid: int, 
     uids: List[int], 
     window: int, 
-    key:str, 
+    key: str, 
     timeout: int,
     device: str,
-) -> List[ Dict[str, torch.Tensor] ]:
+) -> SimpleNamespace:
+    start_time = time.time()
+    
+    # Initialize metrics
+    upload_bytes = 0
+    download_bytes = 0
+    successes = []
+
     # Put the object if exists.
-    if state_dict != None:
+    if state_dict is not None:
         await put( 
-            state_dict = state_dict, 
-            uid = my_uid, 
-            window = window, 
-            key = key
+            state_dict=state_dict, 
+            uid=my_uid, 
+            window=window, 
+            key=key
         )
+        # Calculate upload size
+        upload_bytes = sum(tensor.element_size() * tensor.nelement() for tensor in state_dict.values())
+
     # Create gather tasks for all other objects.
     gather_tasks = []
     for uid in uids:
         gather_tasks.append(
             get_with_retry(
-                uid = uid,
-                window = window,
-                key = key,
-                timeout = timeout
+                uid=uid,
+                window=window,
+                key=key,
+                timeout=timeout
             )
         )        
+    
     # Create buffer for responses.
     gather_result = {
-        key: [ torch.zeros_like(value).to(device) for _ in uids ] for key, value in state_dict.items()
+        key: [torch.zeros_like(value).to(device) for _ in uids] for key, value in state_dict.items()
     }
+    
     # Gather results async.
     responses = await asyncio.gather(*gather_tasks)
-    # Fill results.
-    for uid, resp in enumerate( responses ):
-        if resp == None: continue
+    
+    # Fill results and calculate download size.
+    for uid, resp in enumerate(responses):
+        if resp is None:
+            successes.append(False)
+            continue
+        successes.append(True)
         for key in state_dict.keys():
-            gather_result[ key ][ uid ] = resp[ key ].to(device)   
-    # Return gather result.   
-    return gather_result
-                
+            gather_result[key][uid] = resp[key].to(device)
+            download_bytes += resp[key].element_size() * resp[key].nelement()
+    
+    # Calculate success rate
+    success_rate = sum(successes) / len(successes) if successes else 0
+
+    # Calculate total time
+    total_time = time.time() - start_time
+
+    # Return the result as a SimpleNamespace
+    result = SimpleNamespace(
+        time = total_time,
+        upload_bytes = upload_bytes,
+        download_bytes = download_bytes,
+        success_rate = success_rate,
+        successes = successes,
+        state_dict = gather_result
+    )
+    
+    return result
     

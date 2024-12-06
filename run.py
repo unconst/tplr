@@ -28,6 +28,7 @@ import threading
 import bittensor as bt
 import torch.optim as optim
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # Import local package.
 import tplr
@@ -43,13 +44,13 @@ PROJECT = 'templar' # wandb project.
 SEQUENCE_LENGTH = 1024 # global sequence length.
 PAGES_PER_WINDOW = 2 # Pages to train on (and be evaluated on each window.)
 BATCH_SIZE = 8 # global batch size.
-LEARNING_RATE = 0.001 # global learning rate.
+LEARNING_RATE = 0.01 # global learning rate.
 BLOCKS_PER_WINDOW = 2 # blocks per window step.
 WINDOWS_PER_SYNC = 100 # Step Windows before sync state occurs.
 MOMENTUM_DECAY = 0.999 # momentum deacy rate.
 TOPK_COMPRESSION = 32 # DeMo Topk Compression.
 TARGET_CHUNK = 64 # DeMo chunk size.
-SCORES_ALPHA = 0.001 # Scores moving average.
+SCORES_ALPHA = 0.0001 # Scores moving average.
 WINDOWS_PER_WEIGHTS = 10 # Windows before validator sets weights on chain.
 
 class Miner:
@@ -94,7 +95,8 @@ class Miner:
         if self.uid not in self.peers: self.peers.append( self.uid ) # Add my self to peers.
         tplr.logger.info(f'peers: {self.peers}')
 
-        # Initialize the model with random weights.
+        # Initialize the model with the same seed so that all workers have the same model at init.
+        torch.manual_seed(42)  # Set the seed for reproducibility
         self.model = GPT2LMHeadModel(GPT2LMHeadModel.config_class())
         self.model.to(self.config.device)
         
@@ -107,12 +109,18 @@ class Miner:
         self.optimizer = optim.SGD(self.model.parameters(), lr = LEARNING_RATE)          
         for n, p in self.model.named_parameters():
             self.momentum[n] = torch.zeros_like(p)
+        self.scheduler = CosineAnnealingWarmRestarts(
+            optimizer=self.optimizer,
+            T_0=250,
+            T_mult=1,
+        )
         
         # Init compression.
         self.transformer = tplr.compress.TransformDCT( self.model, target_chunk = TARGET_CHUNK )
         self.compressor = tplr.compress.CompressDCT()
         
         # Init state params.
+        self.step = 0
         self.stop_event = asyncio.Event()
         self.current_block = self.subtensor.block
         self.current_window = int( self.current_block / BLOCKS_PER_WINDOW )
@@ -145,23 +153,23 @@ class Miner:
             step_uid = self.uid if not self.config.is_validator else random.choice(self.config.peers)
             tplr.logger.info('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
             
-            # Optionally sync state.
-            if step_window % WINDOWS_PER_SYNC == 0:
-                tplr.logger.info(f"Sync globally")
-                gather_result = await tplr.comms.gather(
-                    state_dict = self.model.state_dict(),
-                    my_uid = self.uid,
-                    uids = self.peers,
-                    window = int(self.current_window/WINDOWS_PER_SYNC),
-                    key = 'model',
-                    timeout = 30,
-                    device = self.config.device
-                )
-                # Take median of all peers state.
-                state_dict = {name: torch.median(torch.stack(gather_result[name]), dim=0)[0] for name in gather_result}
-                # Load state into model.
-                self.model.load_state_dict(state_dict)
-                tplr.logger.info(f"Done global sync.")
+            # # Optionally sync state.
+            # if step_window % WINDOWS_PER_SYNC == 0 or self.step == 0:
+            #     tplr.logger.info(f"Sync globally")
+            #     gather_result = await tplr.comms.gather(
+            #         state_dict = self.model.state_dict(),
+            #         my_uid = self.uid,
+            #         uids = self.peers,
+            #         window = int(self.current_window/WINDOWS_PER_SYNC),
+            #         key = 'model',
+            #         timeout = 30,
+            #         device = self.config.device
+            #     )
+            #     # Take median of all peers state.
+            #     state_dict = {name: torch.mean(torch.stack(gather_result[name]))for name in gather_result}
+            #     # Load state into model.
+            #     self.model.load_state_dict(state_dict)
+            #     tplr.logger.info(f"Done global sync.")
 
             # Get the pages for this window.
             pages = await tplr.dataset.DatasetLoader.next_pages(
@@ -178,6 +186,7 @@ class Miner:
             tplr.logger.info(f"Pages: {[p[1] for p in pages]} for UID: {step_uid} and Window: {step_window}")
             
             # Accumulate gradient.
+            start_time = time.time()
             tplr.logger.info(f"Start accumulating...")
             self.optimizer.zero_grad()
             self.model.zero_grad()
@@ -191,8 +200,8 @@ class Miner:
                 if self.current_window != step_window:
                     break
             tplr.logger.info(f"Stopped accumulating: {i+1} batches with {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
-            # Log to wandb.
-            if self.config.use_wandb: wandb.log({f"loss": outputs.loss.item()})
+            duration = time.time() - start_time
+            if self.config.use_wandb: wandb.log({f"loss": outputs.loss.item(), "bs": (i+1) * BATCH_SIZE, "toks": ((i+1) * BATCH_SIZE * SEQUENCE_LENGTH)/duration })
                 
             # Reduce gradient using DeMo.
             gradient = {}
@@ -203,7 +212,7 @@ class Miner:
                 # Momentum decay
                 self.momentum[n].mul_( MOMENTUM_DECAY )
                 # Add the grad to the momentum.
-                self.momentum[n].add_( p.grad, alpha = LEARNING_RATE )
+                self.momentum[n].add_(p.grad, alpha=self.scheduler.get_last_lr()[0])
                 # Compress gradient.
                 idxs, vals, xshape, totalk = self.compressor.compress(
                     self.transformer.encode(self.momentum[n]), TOPK_COMPRESSION
@@ -222,7 +231,7 @@ class Miner:
 
             # All-gather share state from all peers with timeout.
             tplr.logger.info(f"Start gather: {self.peers}")
-            gather_result = await tplr.comms.gather(
+            response = await tplr.comms.gather(
                 state_dict = gradient,
                 my_uid = self.uid,
                 uids = self.peers,
@@ -231,14 +240,22 @@ class Miner:
                 timeout = 5,
                 device = self.config.device
             )
-            
+            tplr.logger.info(f"End gather: {list(zip(self.peers, response.successes))}")
+            if self.config.use_wandb: 
+                wandb.log({
+                    "total_time": response.time,
+                    "upload_bytes": response.upload_bytes,
+                    "download_bytes": response.download_bytes,
+                    "success_rate": response.success_rate
+                })
+
             # Decompress state and apply to grad.
             for n, p in self.model.named_parameters():
                 # Decode grad from all nodes
                 if self.config.is_validator:
                     # Get gradient for step uid we are evaluating.
-                    eval_idx = gather_result[n + 'idxs'][ self.peers.index(step_uid) ]
-                    eval_val = gather_result[n + 'vals'][ self.peers.index(step_uid) ]
+                    eval_idx = response.state_dict[n + 'idxs'][ self.peers.index(step_uid) ]
+                    eval_val = response.state_dict[n + 'vals'][ self.peers.index(step_uid) ]
                     # Decompress their gradinet.
                     their_grad = self.transformer.decode(
                         self.compressor.decompress(p, eval_idx, eval_val, xshapes[ n ], totalks[ n ])
@@ -258,18 +275,19 @@ class Miner:
                 # Decompress all gradients in batch form to produce shared gradient.
                 new_grad = self.transformer.decode(
                     self.compressor.batch_decompress(
-                        p, gather_result[n + 'idxs'], gather_result[n + 'vals'], xshapes[ n ], totalks[ n ]
+                        p, response.state_dict[n + 'idxs'], response.state_dict[n + 'vals'], xshapes[ n ], totalks[ n ]
                     )
                 )
                 # Set recomputed gathered gradient.
                 if p.grad is None: p.grad = new_grad
                 else: p.grad.copy_(new_grad)
                 # Sign-SGD
-                p.grad.sign_()
+                # p.grad.sign_()
                     
             # Apply the optimizer step
             tplr.logger.info(f"Finish and step.")
             self.optimizer.step()
+            self.scheduler.step()
             
             # Set weights on the chain based on current weights.
             if self.config.is_validator and step_window % WINDOWS_PER_WEIGHTS == 0:
@@ -285,11 +303,12 @@ class Miner:
                 )
                 
             # Check for autoupdate every 360 blocks.
-            if self.current_block % 360 == 0:
-                tplr.optionally_auto_update( SPEC_VERSION )
+            # if self.current_block % 360 == 0:
+            #     tplr.optionally_auto_update( SPEC_VERSION )
             
             # Wait for end of window (if not already done.)
             while self.current_window == step_window: time.sleep(0.1)
+            self.step += 1
             
     # Listens for new blocks and sets self.current_block and self.current_window
     def block_listener(self, loop):

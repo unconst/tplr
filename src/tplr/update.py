@@ -85,6 +85,7 @@ def update_and_restart():
     
     # Pull latest changes
     try:
+        subprocess.run(["git", "stash"], check=True)
         subprocess.run(["git", "pull", "origin", "master"], check=True)
     except Exception as e:
         tplr.logger.error(f"Failed to pull latest changes from git: {e}")
