@@ -30,7 +30,7 @@ uv sync
 Run a node (miner or validator):
 ```bash
 # Run script for miner and validator.
-pm2 start run.py \
+AWS_ACCESS_KEY_ID=<>; AWS_SECRET_ACCESS_KEY=<>; pm2 start run.py \
     # run.py interpreter.
     --interpreter python3 \
     # pm2 process name

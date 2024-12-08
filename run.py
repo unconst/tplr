@@ -25,26 +25,36 @@ import random
 import asyncio
 import argparse
 import threading
+import numpy as np
 import bittensor as bt
 import torch.optim as optim
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import AutoTokenizer, LlamaConfig
+from transformers import LlamaForCausalLM
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # Import local package.
 import tplr
 
 # GPU optimizations.
-torch.backends.cudnn.benchmark = True
+# Set seeds for reproducibility
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+np.random.seed(42)
+random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # Globals: determined by master.
 SPEC_VERSION = 5 # Run version.
-PROJECT = 'templar' # wandb project.
+PROJECT = f'llama-demo' # wandb project.
 SEQUENCE_LENGTH = 1024 # global sequence length.
-PAGES_PER_WINDOW = 2 # Pages to train on (and be evaluated on each window.)
+PAGES_PER_WINDOW = 5 # Pages to train on (and be evaluated on each window.)
 BATCH_SIZE = 8 # global batch size.
-LEARNING_RATE = 0.01 # global learning rate.
+WEIGHT_DECAY = 0.1
+LEARNING_RATE = 4e-4 # global learning rate.
 BLOCKS_PER_WINDOW = 2 # blocks per window step.
 WINDOWS_PER_SYNC = 100 # Step Windows before sync state occurs.
 MOMENTUM_DECAY = 0.999 # momentum deacy rate.
@@ -53,12 +63,29 @@ TARGET_CHUNK = 64 # DeMo chunk size.
 SCORES_ALPHA = 0.0001 # Scores moving average.
 WINDOWS_PER_WEIGHTS = 10 # Windows before validator sets weights on chain.
 
+tokenizer = AutoTokenizer.from_pretrained(
+    "togethercomputer/LLaMA-2-7B-32K", verbose=False, clean_up_tokenization_spaces=True
+)
+tokenizer.pad_token = tokenizer.eos_token
+
+model_config = LlamaConfig(
+    vocab_size=tokenizer.vocab_size,
+    hidden_size=2048,
+    num_hidden_layers=16,
+    num_attention_heads=8,
+    intermediate_size=8192,
+    num_key_value_heads=8,
+    activation_function="swiGLU",
+    max_position_embeddings=2048,
+)
+
 class Miner:
     
     # Command line config items.
     @staticmethod
     def config():
         parser = argparse.ArgumentParser(description='Miner script')
+        parser.add_argument('--project', type=str, default=PROJECT, help='Wandb project.')
         parser.add_argument('--netuid', type=int, default=229, help='Bittensor network UID.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
@@ -66,6 +93,7 @@ class Miner:
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
         parser.add_argument('--is_validator', action='store_true', help='If validator, turn on to run evals rather than train for incentive.')
         parser.add_argument('--random', action='store_true', help='Trains on a random page instead of correctly assigned.')
+        parser.add_argument('--local', action='store_true', help='Gossip through local file system.')
         parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with. e.g., --uids 1 2 3')
         bt.wallet.add_args( parser )
         bt.subtensor.add_args( parser )
@@ -96,24 +124,19 @@ class Miner:
         tplr.logger.info(f'peers: {self.peers}')
 
         # Initialize the model with the same seed so that all workers have the same model at init.
-        torch.manual_seed(42)  # Set the seed for reproducibility
-        self.model = GPT2LMHeadModel(GPT2LMHeadModel.config_class())
+        self.model = LlamaForCausalLM(config=model_config)
         self.model.to(self.config.device)
+        self.model.train()
         
         # Init tokenizer.
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = tokenizer
         
         # Init optimizer.
-        self.momentum = {}
         self.optimizer = optim.SGD(self.model.parameters(), lr = LEARNING_RATE)          
+        self.momentum = {}
         for n, p in self.model.named_parameters():
             self.momentum[n] = torch.zeros_like(p)
-        self.scheduler = CosineAnnealingWarmRestarts(
-            optimizer=self.optimizer,
-            T_0=250,
-            T_mult=1,
-        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0 = 10000, T_mult = 1, eta_min = LEARNING_RATE * 0.1)
         
         # Init compression.
         self.transformer = tplr.compress.TransformDCT( self.model, target_chunk = TARGET_CHUNK )
@@ -132,10 +155,10 @@ class Miner:
         if self.config.use_wandb:
             # Delete all runs with my name and create a new one.
             try:
-                for run in wandb.Api().runs(path=PROJECT):
+                for run in wandb.Api().runs(path=self.config.project):
                     if run.name == f'M{self.uid}': run.delete()
             except: pass
-            wandb.init(project=PROJECT, resume='allow', name=f'M{self.uid}', config=self.config)
+            wandb.init(project=self.config.project, resume='allow', name=f'M{self.uid}', config=self.config)
         
     # Main training loop.
     async def run( self ):
@@ -150,32 +173,14 @@ class Miner:
             # Record the window we are on.
             step_window = self.current_window
             # Get the uid to seed data (if validator, take random from peers.)
-            step_uid = self.uid if not self.config.is_validator else random.choice(self.config.peers)
+            step_uid = self.uid if not self.config.is_validator else random.choice([peer for peer in self.config.peers if peer != self.uid])
             tplr.logger.info('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
-            
-            # # Optionally sync state.
-            # if step_window % WINDOWS_PER_SYNC == 0 or self.step == 0:
-            #     tplr.logger.info(f"Sync globally")
-            #     gather_result = await tplr.comms.gather(
-            #         state_dict = self.model.state_dict(),
-            #         my_uid = self.uid,
-            #         uids = self.peers,
-            #         window = int(self.current_window/WINDOWS_PER_SYNC),
-            #         key = 'model',
-            #         timeout = 30,
-            #         device = self.config.device
-            #     )
-            #     # Take median of all peers state.
-            #     state_dict = {name: torch.mean(torch.stack(gather_result[name]))for name in gather_result}
-            #     # Load state into model.
-            #     self.model.load_state_dict(state_dict)
-            #     tplr.logger.info(f"Done global sync.")
 
             # Get the pages for this window.
             pages = await tplr.dataset.DatasetLoader.next_pages(
                 offset = step_window,
                 n_pages = PAGES_PER_WINDOW,
-                seed = self.metagraph.hotkeys[ step_uid ] if not self.config.random else random.randint(10000) # Select seed from step_uid.
+                seed = self.metagraph.hotkeys[ step_uid ] if not self.config.random else random.randint(0, 10000) # Select seed from step_uid.
             )            
             loader = await tplr.dataset.DatasetLoader.create(
                 batch_size = BATCH_SIZE,
@@ -198,8 +203,9 @@ class Miner:
                 outputs.loss.backward()
                 print ('loss:', outputs.loss.item())
                 if self.current_window != step_window:
+                    tplr.logger.info('<Exhuasted window>')
                     break
-            tplr.logger.info(f"Stopped accumulating: {i+1} batches with {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
+            tplr.logger.info(f"Stopped accumulating: {i+1} steps, {(i+1) * BATCH_SIZE} bs, and {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
             duration = time.time() - start_time
             if self.config.use_wandb: wandb.log({f"loss": outputs.loss.item(), "bs": (i+1) * BATCH_SIZE, "toks": ((i+1) * BATCH_SIZE * SEQUENCE_LENGTH)/duration })
                 
@@ -209,10 +215,12 @@ class Miner:
             totalks = {}
             transmitted = {}
             for n, p in self.model.named_parameters():
+                # Step-Weight decay
+                p.data.mul_( 1.0 - self.scheduler.get_last_lr()[0] * WEIGHT_DECAY )
                 # Momentum decay
                 self.momentum[n].mul_( MOMENTUM_DECAY )
                 # Add the grad to the momentum.
-                self.momentum[n].add_(p.grad, alpha=self.scheduler.get_last_lr()[0])
+                self.momentum[n].add_( p.grad, alpha=self.scheduler.get_last_lr()[0] )
                 # Compress gradient.
                 idxs, vals, xshape, totalk = self.compressor.compress(
                     self.transformer.encode(self.momentum[n]), TOPK_COMPRESSION
@@ -238,9 +246,10 @@ class Miner:
                 window = step_window,
                 key = 'gradient',
                 timeout = 5,
-                device = self.config.device
+                device = self.config.device,
+                local = self.config.local,
             )
-            tplr.logger.info(f"End gather: {list(zip(self.peers, response.successes))}")
+            tplr.logger.info(f"End gather: ({response.time}) - {list(zip(self.peers, response.successes))}")
             if self.config.use_wandb: 
                 wandb.log({
                     "total_time": response.time,
@@ -263,7 +272,7 @@ class Miner:
                     # Get my recreated gradient.
                     my_grad = transmitted[ n ]
                     # Compute cosine sim score.
-                    score = torch.nn.functional.cosine_similarity(their_grad.flatten(), my_grad.flatten(), dim=0)
+                    score = torch.cdist(their_grad.flatten().unsqueeze(0), my_grad.flatten().unsqueeze(0), p=1).mean()
                     # Compute moving scores and weights.
                     self.scores[step_uid] = SCORES_ALPHA * score + (1 - SCORES_ALPHA) * self.scores[step_uid].expand_as(score)
                     self.weights = torch.softmax(self.scores, dim=0)
@@ -278,17 +287,19 @@ class Miner:
                         p, response.state_dict[n + 'idxs'], response.state_dict[n + 'vals'], xshapes[ n ], totalks[ n ]
                     )
                 )
+                # new_grad += self.momentum[n]
                 # Set recomputed gathered gradient.
                 if p.grad is None: p.grad = new_grad
                 else: p.grad.copy_(new_grad)
                 # Sign-SGD
-                # p.grad.sign_()
+                p.grad.sign_()
                     
             # Apply the optimizer step
             tplr.logger.info(f"Finish and step.")
             self.optimizer.step()
             self.scheduler.step()
-            
+            if self.config.use_wandb: wandb.log({f"lr": self.scheduler.get_last_lr()[0]})
+
             # Set weights on the chain based on current weights.
             if self.config.is_validator and step_window % WINDOWS_PER_WEIGHTS == 0:
                 
@@ -307,6 +318,7 @@ class Miner:
             #     tplr.optionally_auto_update( SPEC_VERSION )
             
             # Wait for end of window (if not already done.)
+            tplr.logger.info(f"Wait...")
             while self.current_window == step_window: time.sleep(0.1)
             self.step += 1
             
