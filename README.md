@@ -8,6 +8,12 @@ cd tplr
 
 Install requirements:
 ```bash
+# Update 
+# Run all common updates
+sudo apt-get update
+sudo apt-get upgrade -y
+sudo apt-get dist-upgrade -y
+sudo apt-get autoremove -y
 # Install uv.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
@@ -27,34 +33,10 @@ source .venv/bin/activate
 uv sync
 ```
 
-Run a node (miner or validator):
+Run the swarm
 ```bash
-# Run script for miner and validator.
-AWS_ACCESS_KEY_ID=<>; AWS_SECRET_ACCESS_KEY=<>; pm2 start run.py \
-    # run.py interpreter.
-    --interpreter python3 \
-    # pm2 process name
-    --name node 
-    # Switch to run args.
-    -- \
-    # Walelt specific coldkey to use.
-    --wallet.name ... \
-    # wallet specific hotkey to use.
-    --wallet.hotkey ... \
-    # Bittensor network UID.
-    --netuid ... \ 
-    # Train with specific peer uids from the network only e.g., --peers 1 2 3.
-    --peers ... \
-    # Device to use for training (e.g., cpu or cuda).
-    --device ... \ 
-    # Enable debug logging.
-    --debug \
-    # Enable trace logging.
-    --trace \
-    # Use Weights and Biases for logging.
-    --use_wandb \
-    # Evaluate other miners and set weights on the chain.
-    --is_validator \
-    # Trains on a random page instead of correctly assigned. (for testing).
-    --random \
+# login to wandb
+wandb login
+# run the nodes
+./start.sh my_run
 ```

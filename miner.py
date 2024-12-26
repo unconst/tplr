@@ -86,16 +86,12 @@ class Miner:
     def config():
         parser = argparse.ArgumentParser(description='Miner script')
         parser.add_argument('--project', type=str, default=PROJECT, help='Wandb project.')
-        parser.add_argument('--netuid', type=int, default=229, help='Bittensor network UID.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
         parser.add_argument('--trace', action='store_true', help='Enable trace logging')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
-        parser.add_argument('--is_validator', action='store_true', help='If validator, turn on to run evals rather than train for incentive.')
-        parser.add_argument('--random', action='store_true', help='Trains on a random page instead of correctly assigned.')
-        parser.add_argument('--local', action='store_true', help='Gossip through local file system.')
         parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with. e.g., --uids 1 2 3')
-        bt.wallet.add_args( parser )
+        parser.add_argument('--uid', type=int, default=229, help='This Peer uid.')
         bt.subtensor.add_args( parser )
         bt.logging.add_args( parser )
         config = bt.config( parser )
@@ -105,24 +101,9 @@ class Miner:
     
     def __init__(self):
         # Init config from command line.
-        self.config = Miner.config()
+        self.config = Miner.config()      
+        self.subtensor = bt.subtensor(config = self.config)  
         
-        # Init bittensor objects.
-        self.wallet = bt.wallet( config = self.config )
-        self.subtensor = bt.subtensor( config = self.config )
-        self.metagraph = self.subtensor.metagraph( self.config.netuid )
-        if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
-            tplr.logger.error(f'\n\t[bold]The wallet {self.wallet} is not registered on subnet: {self.metagraph.netuid}[/bold]. You need to register first with: [blue]`btcli subnet register`[/blue]\n')
-            sys.exit()
-        self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-        tplr.logger.info('\n' + '-' * 40 + ' Objects ' + '-' * 40)
-        tplr.logger.info(f'\n{self.wallet}\n{self.subtensor}\n{self.metagraph}\nuid: {self.uid}')
-        
-        # Init peers.
-        self.peers = list( self.metagraph.uids) if self.config.peers == [] else self.config.peers
-        if self.uid not in self.peers: self.peers.append( self.uid ) # Add my self to peers.
-        tplr.logger.info(f'peers: {self.peers}')
-
         # Initialize the model with the same seed so that all workers have the same model at init.
         self.model = LlamaForCausalLM(config=model_config)
         self.model.to(self.config.device)
@@ -147,18 +128,15 @@ class Miner:
         self.stop_event = asyncio.Event()
         self.current_block = self.subtensor.block
         self.current_window = int( self.current_block / BLOCKS_PER_WINDOW )
-        
-        # Init scores.
-        self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32)
-        
+                
         # Init wandb.
         if self.config.use_wandb:
             # Delete all runs with my name and create a new one.
             try:
                 for run in wandb.Api().runs(path=self.config.project):
-                    if run.name == f'M{self.uid}': run.delete()
+                    if run.name == f'M{self.config.uid}': run.delete()
             except: pass
-            wandb.init(project=self.config.project, resume='allow', name=f'M{self.uid}', config=self.config)
+            wandb.init(project=self.config.project, resume='allow', name=f'M{self.config.uid}', config=self.config)
         
     # Main training loop.
     async def run( self ):
@@ -172,15 +150,13 @@ class Miner:
             
             # Record the window we are on.
             step_window = self.current_window
-            # Get the uid to seed data (if validator, take random from peers.)
-            step_uid = self.uid if not self.config.is_validator else random.choice([peer for peer in self.config.peers if peer != self.uid])
-            tplr.logger.info('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
+            print('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
 
             # Get the pages for this window.
             pages = await tplr.dataset.DatasetLoader.next_pages(
                 offset = step_window,
                 n_pages = PAGES_PER_WINDOW,
-                seed = self.metagraph.hotkeys[ step_uid ] if not self.config.random else random.randint(0, 10000) # Select seed from step_uid.
+                seed = self.config.uid
             )            
             loader = await tplr.dataset.DatasetLoader.create(
                 batch_size = BATCH_SIZE,
@@ -188,11 +164,11 @@ class Miner:
                 pages_info = pages,
                 tokenizer = self.tokenizer
             )   
-            tplr.logger.info(f"Pages: {[p[1] for p in pages]} for UID: {step_uid} and Window: {step_window}")
+            print(f"Pages: {[p[1] for p in pages]} for UID: {self.config.uid} and Window: {step_window}")
             
             # Accumulate gradient.
             start_time = time.time()
-            tplr.logger.info(f"Start accumulating...")
+            print(f"Start accumulating...")
             self.optimizer.zero_grad()
             self.model.zero_grad()
             for i, batch in enumerate( loader ):
@@ -203,9 +179,9 @@ class Miner:
                 outputs.loss.backward()
                 print ('loss:', outputs.loss.item())
                 if self.current_window != step_window:
-                    tplr.logger.info('<Exhuasted window>')
+                    print('<Exhuasted window>')
                     break
-            tplr.logger.info(f"Stopped accumulating: {i+1} steps, {(i+1) * BATCH_SIZE} bs, and {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
+            print(f"Stopped accumulating: {i+1} steps, {(i+1) * BATCH_SIZE} bs, and {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
             duration = time.time() - start_time
             if self.config.use_wandb: wandb.log({f"loss": outputs.loss.item(), "bs": (i+1) * BATCH_SIZE, "toks": ((i+1) * BATCH_SIZE * SEQUENCE_LENGTH)/duration })
                 
@@ -238,18 +214,18 @@ class Miner:
                 xshapes[ n ] = xshape; totalks[ n ] = totalk
 
             # All-gather share state from all peers with timeout.
-            tplr.logger.info(f"Start gather: {self.peers}")
+            print(f"Start gather: {self.config.peers}")
             response = await tplr.comms.gather(
                 state_dict = gradient,
-                my_uid = self.uid,
-                uids = self.peers,
+                my_uid = self.config.uid,
+                uids = self.config.peers,
                 window = step_window,
                 key = 'gradient',
                 timeout = 5,
                 device = self.config.device,
-                local = self.config.local,
+                local = True,
             )
-            tplr.logger.info(f"End gather: ({response.time}) - {list(zip(self.peers, response.successes))}")
+            print(f"End gather: ({response.time}) - {list(zip(self.config.peers, response.successes))}")
             if self.config.use_wandb: 
                 wandb.log({
                     "total_time": response.time,
@@ -259,28 +235,7 @@ class Miner:
                 })
 
             # Decompress state and apply to grad.
-            for n, p in self.model.named_parameters():
-                # Decode grad from all nodes
-                if self.config.is_validator:
-                    # Get gradient for step uid we are evaluating.
-                    eval_idx = response.state_dict[n + 'idxs'][ self.peers.index(step_uid) ]
-                    eval_val = response.state_dict[n + 'vals'][ self.peers.index(step_uid) ]
-                    # Decompress their gradinet.
-                    their_grad = self.transformer.decode(
-                        self.compressor.decompress(p, eval_idx, eval_val, xshapes[ n ], totalks[ n ])
-                    )
-                    # Get my recreated gradient.
-                    my_grad = transmitted[ n ]
-                    # Compute cosine sim score.
-                    score = torch.cdist(their_grad.flatten().unsqueeze(0), my_grad.flatten().unsqueeze(0), p=1).mean()
-                    # Compute moving scores and weights.
-                    self.scores[step_uid] = SCORES_ALPHA * score + (1 - SCORES_ALPHA) * self.scores[step_uid].expand_as(score)
-                    self.weights = torch.softmax(self.scores, dim=0)
-                    # Log scores and weights to wandb.
-                    if self.config.use_wandb:
-                        for uid in self.peers:
-                            wandb.log({f"s{uid}": self.scores[uid], f"w{uid}": self.weights[uid] })
-                    
+            for n, p in self.model.named_parameters():                
                 # Decompress all gradients in batch form to produce shared gradient.
                 new_grad = self.transformer.decode(
                     self.compressor.batch_decompress(
@@ -295,30 +250,13 @@ class Miner:
                 p.grad.sign_()
                     
             # Apply the optimizer step
-            tplr.logger.info(f"Finish and step.")
+            print(f"Finish and step.")
             self.optimizer.step()
             self.scheduler.step()
             if self.config.use_wandb: wandb.log({f"lr": self.scheduler.get_last_lr()[0]})
 
-            # Set weights on the chain based on current weights.
-            if self.config.is_validator and step_window % WINDOWS_PER_WEIGHTS == 0:
-                
-                # Set weights on chain.
-                self.subtensor.set_weights(
-                    wallet = self.wallet,
-                    netuid = self.config.netuid,
-                    uids = self.metagraph.uids,
-                    weights = self.weights,
-                    wait_for_inclusion = False, # Dont wait, fire and forget.
-                    wait_for_finalization = False,
-                )
-                
-            # Check for autoupdate every 360 blocks.
-            # if self.current_block % 360 == 0:
-            #     tplr.optionally_auto_update( SPEC_VERSION )
-            
             # Wait for end of window (if not already done.)
-            tplr.logger.info(f"Wait...")
+            print(f"Wait...")
             while self.current_window == step_window: time.sleep(0.1)
             self.step += 1
             
