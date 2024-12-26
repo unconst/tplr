@@ -9,6 +9,8 @@ import asyncio
 from pydantic import ValidationError
 import yaml  # For parsing YAML files
 import os  # For checking file existence
+import numpy as np
+import torch
 
 from .schemas import Bucket
 from .logging import logger
@@ -40,7 +42,7 @@ class ChainManager:
             bucket (Bucket, optional): Bucket configuration to commit
         """
         # self.subtensor = bt.subtensor(config=config)
-        # chain argument instead 
+        # chain argument instead
         self.config = config
         self.netuid = netuid
         self.metagraph = metagraph
@@ -59,6 +61,7 @@ class ChainManager:
 
         # Initialize bucket storage
         self.commitments = {}
+        self.peers = []
         self.fetch_interval = fetch_interval
         self._fetch_task = None
 
@@ -72,14 +75,6 @@ class ChainManager:
             asyncio.run(self.try_commit(self.wallet, self.bucket))
         else:
             logger.warning("Wallet and bucket not provided; skipping try_commit.")
-
-        # # Create a new event loop for initialization
-        # loop = asyncio.new_event_loop()
-        # asyncio.set_event_loop(loop)
-        # try:
-        #     loop.run_until_complete(self.fetch_commitments())
-        # finally:
-        #     loop.close()
 
         # Fetch commitments synchronously to populate self.commitments
         self.fetch_commitments()
@@ -104,6 +99,7 @@ class ChainManager:
                 commitments = await self.get_commitments()
                 if commitments:
                     self.commitments = commitments
+                    self.update_peers_with_buckets()
                     logger.debug(f"Updated commitments: {self.commitments}")
             except Exception as e:
                 logger.error(f"Error fetching commitments: {e}")
@@ -362,33 +358,6 @@ class ChainManager:
             )
             return None
 
-    async def initialize_bucket(self, wallet: "bt.wallet", bucket: Bucket):
-        """Initialize or update bucket configuration for a neuron
-
-        Args:
-            wallet: The neuron's wallet
-            bucket: Bucket configuration to commit
-        """
-        try:
-            # First try to get existing bucket
-            existing = await self.get_bucket_for_neuron(wallet)
-
-            if existing != bucket:
-                # Commit new bucket config if different
-                await self.commit(wallet, bucket)
-                logger.info(
-                    f"Updated bucket configuration for {wallet.hotkey.ss58_address}"
-                )
-            else:
-                logger.debug(
-                    f"Bucket configuration unchanged for {wallet.hotkey.ss58_address}"
-                )
-
-        except Exception:
-            # Commit new bucket if none exists
-            await self.commit(wallet, bucket)
-            logger.info(f"Initialized new bucket for {wallet.hotkey.ss58_address}")
-
     def fetch_commitments(self):
         """Synchronously fetches commitments and updates self.commitments."""
         try:
@@ -400,9 +369,35 @@ class ChainManager:
         commitments = loop.run_until_complete(self.get_commitments())
         if commitments:
             self.commitments = commitments
+            self.update_peers_with_buckets()
             logger.debug(f"Fetched commitments synchronously: {self.commitments}")
         else:
             logger.warning("No commitments fetched.")
+
+    def get_hotkey(self, uid: int) -> Optional[str]:
+        """Returns the hotkey for a given UID."""
+        # Handle different data types for uids
+        if isinstance(self.metagraph.uids, (np.ndarray, torch.Tensor)):
+            uids_list = self.metagraph.uids.tolist()
+        else:
+            uids_list = self.metagraph.uids
+
+        # Handle different data types for hotkeys
+        if isinstance(self.metagraph.hotkeys, (np.ndarray, torch.Tensor)):
+            hotkeys_list = self.metagraph.hotkeys.tolist()
+        else:
+            hotkeys_list = self.metagraph.hotkeys
+
+        if uid in uids_list:
+            index = uids_list.index(uid)
+            return hotkeys_list[index]
+        else:
+            return None
+
+    def update_peers_with_buckets(self):
+        """Updates the list of peers (UIDs) that have buckets."""
+        self.peers = [int(uid) for uid in self.commitments.keys()]
+        logger.info(f"Updated peers with buckets: {self.peers}")
 
 
 def get_own_bucket() -> Bucket:

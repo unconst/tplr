@@ -56,6 +56,11 @@ DEFAULT_HPARAMS = {
     
     # Bucket configuration
     "bucket_name": "your-default-bucket-name",
+    
+    # Scheduler parameters
+    "warmup_steps": 250,
+    "alpha_f": 0.1,  # Final learning rate multiplier
+    "t_max": 20000,  # Total steps for cosine decay
 }
 
 def create_namespace(hparams: dict) -> SimpleNamespace:

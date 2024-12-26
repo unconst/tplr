@@ -26,6 +26,7 @@ import torch
 from aiobotocore.session import get_session
 import bittensor as bt
 from typing import List, Dict, Optional
+import yaml
 
 # Local imports
 from . import __version__
@@ -42,33 +43,65 @@ def get_base_url(account_id):
     return f"https://{account_id}.r2.cloudflarestorage.com"
 
 
-class Comms:
+class Comms(ChainManager):
     def __init__(
         self,
         wallet: "bt.wallet",
-        bucket: Bucket,
-        chain_manager: "ChainManager",
         save_location: str = "/tmp",
         key_prefix: str = "slice",
+        **kwargs
     ):
-        """Initialize Comms handler
-
-        Args:
-            wallet: Wallet for this neuron
-            bucket: Bucket configuration for this neuron
-            save_location: Path for temporary storage
-            key_prefix: Prefix for stored files
-        """
         self.wallet = wallet
-        self.bucket = bucket
-        self.chain_manager = chain_manager
-        self.save_location = save_location
+        self.bucket = self.get_own_bucket()
+        super().__init__(
+            config=kwargs.get('config'),
+            netuid=kwargs.get('netuid'),
+            metagraph=kwargs.get('metagraph'),
+            hparams=kwargs.get('hparams'),
+            wallet=self.wallet,
+            bucket=self.bucket,
+        )
+        # Use the hotkey directly in the save_location
+        hotkey = self.wallet.hotkey.ss58_address
+        self.save_location = os.path.join("/tmp", f"hotkey_{hotkey}")
+        os.makedirs(self.save_location, exist_ok=True)
         self.key_prefix = key_prefix
         self.session = get_session()
         self.lock = asyncio.Lock()
-
         # Load bucket secrets
         self.bucket_secrets = BUCKET_SECRETS
+
+    def get_own_bucket(self) -> Bucket:
+        """Parses the credentials from .env.yaml to create a Bucket object."""
+        env_file = ".env.yaml"
+        if not os.path.isfile(env_file):
+            logger.error(f"The {env_file} file was not found.")
+            raise FileNotFoundError(f"The {env_file} file was not found.")
+
+        try:
+            with open(env_file, "r") as file:
+                credentials = yaml.safe_load(file)
+        except yaml.YAMLError as e:
+            logger.error(f"Error parsing {env_file}: {e}")
+            raise e
+
+        try:
+            account_id = credentials["account_id"]
+            read_access_key_id = credentials["read"]["access_key_id"]
+            read_secret_access_key = credentials["read"]["secret_access_key"]
+
+            # Create a Bucket object
+            bucket = Bucket(
+                name=account_id,
+                account_id=account_id,
+                access_key_id=read_access_key_id,
+                secret_access_key=read_secret_access_key,
+            )
+            logger.debug(f"Parsed bucket from {env_file}: {bucket}")
+            return bucket
+        except KeyError as e:
+            logger.error(f"Missing key in {env_file}: {e}")
+            raise e
 
     async def put(
         self,
@@ -76,7 +109,6 @@ class Comms:
         uid: str,
         window: int,
         key: Optional[str] = None,
-        global_step: int = 0,
     ):
         """
         Uploads a slice of the model parameters to the R2 bucket.
@@ -86,37 +118,53 @@ class Comms:
             uid (str): Unique identifier for the upload (e.g., hotkey or user ID).
             window (int): The window number for synchronization.
             key (str, optional): Custom key for the filename. Defaults to self.key_prefix.
-            global_step (int): Global training step.
         """
         key = key or self.key_prefix
-        filename = f"{key}-{window}-{uid}-v{__version__}.pt"
+        hotkey = self.wallet.hotkey.ss58_address
+        filename = f"{key}-{window}-{hotkey}-v{__version__}.pt"
         temp_file_path = os.path.join(self.save_location, filename)
-        # Include global_step in state_dict
-        state_dict["global_step"] = global_step
-        # Save the state_dict to a temporary file
-        torch.save(state_dict, temp_file_path)
 
-        # Upload the file to R2 bucket
-        async with self.session.create_client(
-            "s3",
-            endpoint_url=get_base_url(self.bucket_secrets["account_id"]),
-            region_name=CF_REGION_NAME,
-            config=client_config,
-            aws_access_key_id=self.bucket_secrets["write"]["access_key_id"],
-            aws_secret_access_key=self.bucket_secrets["write"]["secret_access_key"],
-        ) as s3_client:
-            try:
+        # Ensure the save directory exists
+        os.makedirs(self.save_location, exist_ok=True)
+
+        try:
+            # Save the state_dict to a temporary file
+            torch.save(state_dict, temp_file_path)
+            logger.debug(f"Temporary file saved at {temp_file_path}")
+        except Exception as e:
+            logger.error(f"Error saving temporary file: {e}")
+            raise
+
+        # Upload the file to your own R2 bucket
+        try:
+            async with self.session.create_client(
+                "s3",
+                endpoint_url=get_base_url(BUCKET_SECRETS["account_id"]),
+                region_name=CF_REGION_NAME,
+                config=client_config,
+                aws_access_key_id=BUCKET_SECRETS["write"]["access_key_id"],
+                aws_secret_access_key=BUCKET_SECRETS["write"]["secret_access_key"],
+            ) as s3_client:
                 async with aiofiles.open(temp_file_path, "rb") as f:
                     data = await f.read()
                     await s3_client.put_object(
                         Bucket=self.bucket.name, Key=filename, Body=data
                     )
                 logger.debug(f"Successfully uploaded {filename} to R2 bucket.")
+        except Exception as e:
+            logger.error(f"Failed to upload {filename} to R2 bucket: {e}")
+            raise
+        finally:
+            # Clean up the temporary file if it exists
+            logger.debug(f"Attempting to delete temporary file at {temp_file_path}")
+            try:
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+                    logger.debug(f"Deleted temporary file at {temp_file_path}")
+                else:
+                    logger.debug(f"Temporary file does not exist at {temp_file_path}")
             except Exception as e:
-                logger.error(f"Failed to upload {filename} to R2 bucket: {e}")
-            finally:
-                # Clean up the temporary file
-                os.remove(temp_file_path)
+                logger.error(f"Error during cleanup of temporary file: {e}")
 
     async def get(
         self,
@@ -138,11 +186,24 @@ class Comms:
             dict: The state dictionary downloaded from the bucket.
         """
         key = key or self.key_prefix
-        filename = f"{key}-{window}-{uid}-v{__version__}.pt"
+        # Get the hotkey for the UID
+        hotkey = self.get_hotkey(int(uid))
+        if hotkey is None:
+            logger.error(f"No hotkey found for uid {uid}")
+            return None
+        filename = f"{key}-{window}-{hotkey}-v{__version__}.pt"
         temp_file_path = os.path.join(self.save_location, filename)
 
         # Get bucket credentials for this uid
-        bucket = self.chain_manager.get_bucket(uid)
+        # Wait until the bucket is available
+        bucket = self.get_bucket(int(uid))
+        if bucket is None:
+            logger.debug(f"Bucket for uid {uid} not found. Skipping...")
+            return None
+
+        if bucket is None:
+            logger.error(f"No bucket found for uid {uid} after retries.")
+            return None
 
         async with self.session.create_client(
             "s3",
@@ -153,21 +214,21 @@ class Comms:
             aws_secret_access_key=bucket.secret_access_key,
         ) as s3_client:
             try:
-                # Use asyncio timeout
-                async with asyncio.timeout(timeout):
+                # Use asyncio.wait_for instead of asyncio.timeout
+                async def download():
                     response = await s3_client.get_object(
-                        Bucket=self.bucket.name, Key=filename
+                        Bucket=bucket.name, Key=filename
                     )
                     async with aiofiles.open(temp_file_path, "wb") as f:
                         while True:
-                            chunk = await response["Body"].read(
-                                1024 * 1024
-                            )  # Read 1 MB chunks
+                            chunk = await response["Body"].read(1024 * 1024)  # 1 MB chunks
                             if not chunk:
                                 break
                             await f.write(chunk)
+
+                await asyncio.wait_for(download(), timeout=timeout)
                 # Load the state_dict
-                state_dict = torch.load(temp_file_path, map_location="cpu")
+                state_dict = torch.load(temp_file_path, map_location="cpu", weights_only=True)
                 logger.debug(f"Successfully downloaded {filename} from R2 bucket.")
                 return state_dict
             except asyncio.TimeoutError:
@@ -240,6 +301,8 @@ class Comms:
         key = key or self.key_prefix
         # Put own state_dict to the bucket
         await self.put(state_dict, my_uid, window, key)
+
+        time.sleep(5)
 
         # Gather state_dicts from peers
         gather_tasks = [

@@ -1,4 +1,4 @@
-# The MIT License (MIT)
+ # The MIT License (MIT)
 # © 2024 templar.tech
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
@@ -39,7 +39,7 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-class Neuron:
+class Miner:
     
     # Command line config items.
     @staticmethod
@@ -50,7 +50,6 @@ class Neuron:
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
         parser.add_argument('--trace', action='store_true', help='Enable trace logging')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
-        parser.add_argument('--is_validator', action='store_true', help='If validator, turn on to run evals rather than train for incentive.')
         parser.add_argument('--random', action='store_true', help='Trains on a random page instead of correctly assigned.')
         parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with. e.g., --uids 1 2 3')
         parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to save/load the checkpoint. If None, the path is set to checkpoint-M<UID>.pth.')
@@ -69,7 +68,7 @@ class Neuron:
         tplr.logger.debug("Starting initialization...")
 
         # Init config from command line
-        self.config = Neuron.config()
+        self.config = Miner.config()
 
         # # Init AutoUpdate
         # self.autoupdate = tplr.autoupdate.AutoUpdate()
@@ -109,12 +108,7 @@ class Neuron:
         self.optimizer = optim.SGD(self.model.parameters(), lr = self.hparams.learning_rate)          
         for n, p in self.model.named_parameters():
             self.momentum[n] = torch.zeros_like(p)
-        self.scheduler = tplr.CosineWarmupScheduler(
-            optimizer=self.optimizer,
-            warmup_steps=self.hparams.warmup_steps,
-            alpha_f=self.hparams.alpha_f,
-            t_max=self.hparams.t_max
-        )
+        self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0 = 10000, T_mult = 1, eta_min = self.hparams.learning_rate * 0.1)
 
         # Init compression.
         self.transformer = tplr.compress.TransformDCT( self.model, target_chunk = self.hparams.target_chunk )
@@ -152,6 +146,18 @@ class Neuron:
         #         is_validator=False, 
         #         hparams=self.hparams
         #     )
+        # )
+
+        # self.bucket = tplr.get_own_bucket()  
+
+        # #  initialize ChainManager
+        # self.chain_manager = tplr.chain.ChainManager(
+        #     config=self.config,
+        #     netuid=self.config.netuid,
+        #     metagraph=self.metagraph,
+        #     hparams=self.hparams,
+        #     wallet=self.wallet,
+        #     bucket=self.bucket,
         # )
 
 
@@ -390,6 +396,6 @@ class Neuron:
             except Exception:
                 time.sleep(1) 
 
-# Start miner/validator.
+# Start miner.
 if __name__ == "__main__":
-    asyncio.run( Neuron().run() )
+    asyncio.run( Miner().run() )
