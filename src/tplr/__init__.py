@@ -23,8 +23,13 @@
 __version__ = "0.1.9"
 
 # Import package.
+from .autoupdate import *
+from .chain import *
+from .checkpoint import *
 from .comms import *
 from .compress import *
 from .dataset import *
+from .hparams import *
 from .logging import *
 from .update import *
+from .wandb import *

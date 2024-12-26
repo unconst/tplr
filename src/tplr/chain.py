@@ -7,56 +7,94 @@ import bittensor as bt
 from bittensor import Wallet
 import asyncio
 from pydantic import ValidationError
+import yaml  # For parsing YAML files
+import os  # For checking file existence
 
 from .schemas import Bucket
-from .logging import logger 
+from .logging import logger
+
 
 class ChainManager:
     """Base class for handling chain interactions."""
-    
+
     def __init__(
         self,
-        subtensor: Optional["bt.Subtensor"] = None,
+        config,
         netuid: Optional[int] = None,
-        metagraph = None,
-        hparams = None,
+        metagraph=None,
+        hparams=None,
         fetch_interval: int = 60,  # Fetch interval in seconds
+        wallet: Optional["bt.wallet"] = None,
+        bucket: Optional[Bucket] = None,
     ):
         """
         Initialize chain commitment handler.
 
         Args:
-            subtensor (bt.Subtensor, optional): Subtensor instance for chain operations
-            netuid (int, optional): Network UID for chain operations
+            subtensor (bt.Subtensor): Subtensor instance for chain operations
+            netuid (int): Network UID for chain operations
             metagraph: Metagraph instance containing network state
             hparams: Hyperparameters namespace containing model configuration
             fetch_interval (int): Interval in seconds between fetching commitments
+            wallet (bt.wallet, optional): Wallet to sign commitments
+            bucket (Bucket, optional): Bucket configuration to commit
         """
-        self.subtensor = subtensor
+        # self.subtensor = bt.subtensor(config=config)
+        # chain argument instead 
+        self.config = config
         self.netuid = netuid
         self.metagraph = metagraph
-        self.hparams = hparams
-        
+        self.hparams = hparams or {}
+
         # Block and window tracking
         self.current_block = 0
         self.current_window = 0
-        self.window_duration = 0
+        self.window_duration = self.hparams.blocks_per_window
         self.window_time = 0
         self.window_seeds = {}
-        
+
         # Events
         self.block_event = asyncio.Event()
         self.new_window_event = asyncio.Event()
 
-        # Commitments storage
+        # Initialize bucket storage
         self.commitments = {}
         self.fetch_interval = fetch_interval
         self._fetch_task = None
 
+        # Store wallet and bucket
+        self.wallet = wallet
+        self.bucket = bucket
+
+        # Try to commit bucket to the chain
+        if self.wallet and self.bucket:
+            # Commit bucket synchronously
+            asyncio.run(self.try_commit(self.wallet, self.bucket))
+        else:
+            logger.warning("Wallet and bucket not provided; skipping try_commit.")
+
+        # # Create a new event loop for initialization
+        # loop = asyncio.new_event_loop()
+        # asyncio.set_event_loop(loop)
+        # try:
+        #     loop.run_until_complete(self.fetch_commitments())
+        # finally:
+        #     loop.close()
+
+        # Fetch commitments synchronously to populate self.commitments
+        self.fetch_commitments()
+
+        # Start fetching commitments
+        self.start_commitment_fetcher()
+
     def start_commitment_fetcher(self):
         """Starts the background task to fetch commitments periodically."""
         if self._fetch_task is None:
-            loop = asyncio.get_running_loop()
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
             self._fetch_task = loop.create_task(self._fetch_commitments_periodically())
 
     async def _fetch_commitments_periodically(self):
@@ -90,7 +128,6 @@ class ChainManager:
         """
         return {uid: self.get_bucket(uid) for uid in self.metagraph.uids}
 
-
     def block_to_window(self, block: int) -> int:
         """Returns the slice window based on a block."""
         return int(block / self.hparams.window_length)
@@ -101,64 +138,81 @@ class ChainManager:
 
     def block_listener(self, loop):
         """Listens for new blocks and updates current block/window state.
-        
+
         Args:
             loop: The event loop to run the listener in
-            
+
         This method subscribes to block headers from the subtensor network and:
         - Updates self.current_block with the latest block number
         - Updates self.current_window when crossing window boundaries
         - Retries on connection errors until stop_event is set
         """
+
         def handler(event, _u, _s):
-            self.current_block = int(event['header']['number'])
-            if int( self.current_block / self.hparams.blocks_per_window ) != self.current_window:
-                self.current_window = int( self.current_block / self.hparams.blocks_per_window ) 
+            self.current_block = int(event["header"]["number"])
+            if (
+                int(self.current_block / self.hparams.blocks_per_window)
+                != self.current_window
+            ):
+                self.current_window = int(
+                    self.current_block / self.hparams.blocks_per_window
+                )
+
         while not self.stop_event.is_set():
             try:
-                bt.subtensor(config=self.config).substrate.subscribe_block_headers(handler)
+                bt.subtensor(config=self.config).substrate.subscribe_block_headers(
+                    handler
+                )
                 break
             except Exception:
                 time.sleep(1)
 
-    async def commit(self, wallet: Wallet, bucket: Bucket) -> None:
+    async def commit(self, wallet: "bt.wallet", bucket: Bucket) -> None:
         """Commits bucket configuration to the chain.
 
         Args:
             wallet (bt.wallet): Wallet to sign the commitment
             bucket (Bucket): Bucket configuration to commit
         """
-        if not self.subtensor or not self.netuid:
+        if self.netuid:
             raise ValueError("Subtensor and netuid must be set for chain operations")
 
         concatenated = (
-            bucket.account_id +
-            bucket.access_key_id +
-            bucket.secret_access_key
+            bucket.account_id + bucket.access_key_id + bucket.secret_access_key
         )
-        self.subtensor.commit(wallet, Wallet, concatenated)
-        logger.info(f"Committed bucket configuration to chain for hotkey {wallet.hotkey.ss58_address}")
+        self.subtensor.commit(wallet, self.netuid, concatenated)
+        logger.info(
+            f"Committed bucket configuration to chain for hotkey {wallet.hotkey.ss58_address}"
+        )
 
     async def try_commit(self, wallet: Wallet, bucket: Bucket) -> None:
         """Attempts to verify existing commitment matches current bucket config and commits if not.
-        
+
         Args:
             wallet (bt.wallet): Wallet to sign the commitment
             bucket (Bucket): Current bucket configuration to verify/commit
         """
         try:
             # Get existing commitment
-            commitment = self.get_commitment(wallet.hotkey.get_uid(self.netuid))
-            
+            commitment = self.get_commitment(
+                self.metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+            )
+
             # Convert Bucket objects to concatenated strings for comparison
-            commitment_str = commitment.name + commitment.access_key_id + commitment.secret_access_key
+            commitment_str = (
+                commitment.name
+                + commitment.access_key_id
+                + commitment.secret_access_key
+            )
             current_str = bucket.name + bucket.access_key_id + bucket.secret_access_key
-            
-            logger.debug(f'Comparing:\nCommitment: {commitment_str}\nCurrent: {current_str}')
-            
+
+            logger.debug(
+                f"Comparing:\nCommitment: {commitment_str}\nCurrent: {current_str}"
+            )
+
             if current_str != commitment_str:
                 raise ValueError("Bucket commitment data does not match")
-                
+
         except Exception as e:
             logger.error(f"Commitment error: {str(e)}")
             await self.commit(wallet, bucket)
@@ -203,8 +257,10 @@ class ChainManager:
             Exception: If an error occurs while retrieving the commitment data
                 from the subtensor network.
         """
+
+        subtensor = bt.subtensor(config=self.config)
         try:
-            concatenated = self.subtensor.get_commitment(self.netuid, uid)
+            concatenated = subtensor.get_commitment(self.netuid, uid)
             logger.success(f"Commitment fetched: {concatenated}")
         except Exception as e:
             raise Exception(f"Couldn't get commitment from uid {uid} because {e}")
@@ -223,7 +279,6 @@ class ChainManager:
         except ValidationError as e:
             raise ValueError(f"Invalid data in commitment: {e}")
 
-
     async def get_commitments(self, block: Optional[int] = None) -> Dict[int, Bucket]:
         """Retrieves all bucket commitments from the chain.
 
@@ -233,15 +288,17 @@ class ChainManager:
         Returns:
             Dict[int, Bucket]: Mapping of UIDs to their bucket configurations
         """
-        if not self.subtensor or not self.netuid or not self.metagraph:
-            raise ValueError("Subtensor, netuid and metagraph must be set for chain operations")
-
-        substrate = self.subtensor.substrate
-        result = await substrate.query_map(
+        # if self.netuid or not self.metagraph:
+        #     raise ValueError(
+        #         "Subtensor, netuid and metagraph must be set for chain operations"
+        #     )
+        subtensor = bt.subtensor(config=self.config)
+        substrate = subtensor.substrate
+        result = substrate.query_map(
             module="Commitments",
             storage_function="CommitmentOf",
             params=[self.netuid],
-            block_hash=None if block is None else substrate.get_block_hash(block)
+            block_hash=None if block is None else substrate.get_block_hash(block),
         )
 
         hotkey_to_uid = dict(zip(self.metagraph.hotkeys, self.metagraph.uids))
@@ -266,7 +323,9 @@ class ChainManager:
             try:
                 concatenated = bytes.fromhex(field_value).decode("utf-8").strip()
                 if len(concatenated) != 128:
-                    logger.error(f"Invalid commitment length for UID {uid}: {len(concatenated)}")
+                    logger.error(
+                        f"Invalid commitment length for UID {uid}: {len(concatenated)}"
+                    )
                     continue
 
                 bucket = Bucket(
@@ -283,3 +342,97 @@ class ChainManager:
                 continue
 
         return commitments
+
+    async def get_bucket_for_neuron(self, wallet: "bt.wallet") -> Optional[Bucket]:
+        """Get bucket configuration for a specific neuron's wallet
+
+        Args:
+            wallet (bt.wallet): The wallet to get bucket for
+
+        Returns:
+            Optional[Bucket]: The bucket assigned to this neuron, or None if not found
+        """
+        try:
+            # Get UID by finding hotkey's index in metagraph
+            uid = self.metagraph.hotkeys.index(wallet.hotkey.ss58_address)
+            return await self.get_bucket(uid)
+        except ValueError:
+            logger.warning(
+                f"Hotkey {wallet.hotkey.ss58_address} not found in metagraph"
+            )
+            return None
+
+    async def initialize_bucket(self, wallet: "bt.wallet", bucket: Bucket):
+        """Initialize or update bucket configuration for a neuron
+
+        Args:
+            wallet: The neuron's wallet
+            bucket: Bucket configuration to commit
+        """
+        try:
+            # First try to get existing bucket
+            existing = await self.get_bucket_for_neuron(wallet)
+
+            if existing != bucket:
+                # Commit new bucket config if different
+                await self.commit(wallet, bucket)
+                logger.info(
+                    f"Updated bucket configuration for {wallet.hotkey.ss58_address}"
+                )
+            else:
+                logger.debug(
+                    f"Bucket configuration unchanged for {wallet.hotkey.ss58_address}"
+                )
+
+        except Exception:
+            # Commit new bucket if none exists
+            await self.commit(wallet, bucket)
+            logger.info(f"Initialized new bucket for {wallet.hotkey.ss58_address}")
+
+    def fetch_commitments(self):
+        """Synchronously fetches commitments and updates self.commitments."""
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        commitments = loop.run_until_complete(self.get_commitments())
+        if commitments:
+            self.commitments = commitments
+            logger.debug(f"Fetched commitments synchronously: {self.commitments}")
+        else:
+            logger.warning("No commitments fetched.")
+
+
+def get_own_bucket() -> Bucket:
+    """Parses the credentials from .env.yaml to create a Bucket object."""
+    env_file = ".env.yaml"
+    if not os.path.isfile(env_file):
+        logger.error(f"The {env_file} file was not found.")
+        raise FileNotFoundError(f"The {env_file} file was not found.")
+
+    try:
+        with open(env_file, "r") as file:
+            credentials = yaml.safe_load(file)
+    except yaml.YAMLError as e:
+        logger.error(f"Error parsing {env_file}: {e}")
+        raise e
+
+    try:
+        account_id = credentials["account_id"]
+        read_access_key_id = credentials["read"]["access_key_id"]
+        read_secret_access_key = credentials["read"]["secret_access_key"]
+
+        # Create a Bucket object
+        bucket = Bucket(
+            name=account_id,
+            account_id=account_id,
+            access_key_id=read_access_key_id,
+            secret_access_key=read_secret_access_key,
+        )
+        logger.debug(f"Parsed bucket from {env_file}: {bucket}")
+        return bucket
+    except KeyError as e:
+        logger.error(f"Missing key in {env_file}: {e}")
+        raise e

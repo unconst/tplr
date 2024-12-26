@@ -19,38 +19,25 @@
 # Global imports.
 import sys
 import time
-import wandb
 import torch
 import random
 import asyncio
 import argparse
 import threading
 import bittensor as bt
+import os
 import torch.optim as optim
-from transformers import GPT2LMHeadModel, GPT2Tokenizer
+from transformers import LlamaForCausalLM
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # Import local package.
 import tplr
+import tplr.checkpoint
 
 # GPU optimizations.
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
-# Globals: determined by master.
-SPEC_VERSION = 5 # Run version.
-PROJECT = 'templar' # wandb project.
-SEQUENCE_LENGTH = 1024 # global sequence length.
-PAGES_PER_WINDOW = 2 # Pages to train on (and be evaluated on each window.)
-BATCH_SIZE = 8 # global batch size.
-LEARNING_RATE = 0.001 # global learning rate.
-BLOCKS_PER_WINDOW = 2 # blocks per window step.
-WINDOWS_PER_SYNC = 100 # Step Windows before sync state occurs.
-MOMENTUM_DECAY = 0.999 # momentum deacy rate.
-TOPK_COMPRESSION = 32 # DeMo Topk Compression.
-TARGET_CHUNK = 64 # DeMo chunk size.
-SCORES_ALPHA = 0.001 # Scores moving average.
-WINDOWS_PER_WEIGHTS = 10 # Windows before validator sets weights on chain.
 
 class Neuron:
     
@@ -58,7 +45,7 @@ class Neuron:
     @staticmethod
     def config():
         parser = argparse.ArgumentParser(description='Miner / Validator script')
-        parser.add_argument('--netuid', type=int, default=229, help='Bittensor network UID.')
+        parser.add_argument('--netuid', type=int, default=268, help='Bittensor network UID.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
         parser.add_argument('--trace', action='store_true', help='Enable trace logging')
@@ -66,21 +53,30 @@ class Neuron:
         parser.add_argument('--is_validator', action='store_true', help='If validator, turn on to run evals rather than train for incentive.')
         parser.add_argument('--random', action='store_true', help='Trains on a random page instead of correctly assigned.')
         parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with. e.g., --uids 1 2 3')
+        parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to save/load the checkpoint. If None, the path is set to checkpoint-M<UID>.pth.')
+        parser.add_argument('--save-location', type=str, default=None, help='Directory to save/load slice files')
         bt.wallet.add_args( parser )
         bt.subtensor.add_args( parser )
         bt.logging.add_args( parser )
         config = bt.config( parser )
         if config.debug:
-            tplr.debug()
-        
+            tplr.debug()      
         if config.trace:
             tplr.trace()
         return config
     
     def __init__(self):
-        # Init config from command line.
+        tplr.logger.debug("Starting initialization...")
+
+        # Init config from command line
         self.config = Neuron.config()
-        
+
+        # Init AutoUpdate
+        self.autoupdate = tplr.autoupdate.AutoUpdate()
+
+        # Load hyperparameters
+        self.hparams = tplr.load_hparams()
+                
         # Init bittensor objects.
         self.wallet = bt.wallet( config = self.config )
         self.subtensor = bt.subtensor( config = self.config )
@@ -91,85 +87,128 @@ class Neuron:
         self.uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
         tplr.logger.info('\n' + '-' * 40 + ' Objects ' + '-' * 40)
         tplr.logger.info(f'\n{self.wallet}\n{self.subtensor}\n{self.metagraph}\nuid: {self.uid}')
-        
-        # Init peers.
-        self.peers = list( self.metagraph.uids) if self.config.peers == [] else self.config.peers
-        if self.uid not in self.peers:
-            self.peers.append(self.uid)  # Add myself to peers.
-        tplr.logger.info(f'peers: {self.peers}')
+        tplr.logger.debug("Initialized bittensor objects...")
+        tplr.logger.debug("Initializing buckets...")
+        # Buckets must
+        self.buckets = {}  # Initialize empty dict first
 
-        # Initialize the model with random weights.
-        self.model = GPT2LMHeadModel(GPT2LMHeadModel.config_class())
+
+        # Initialize the model with config from hparams
+        self.model = LlamaForCausalLM(self.hparams.model_config)
         self.model.to(self.config.device)
+        # Print model parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        tplr.logger.info(f"Total parameters: {total_params:,}")
+        tplr.logger.debug("Initialized model...")
         
         # Init tokenizer.
-        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer = self.hparams.tokenizer
         
         # Init optimizer.
         self.momentum = {}
-        self.optimizer = optim.SGD(self.model.parameters(), lr = LEARNING_RATE)          
+        self.optimizer = optim.SGD(self.model.parameters(), lr = self.hparams.learning_rate)          
         for n, p in self.model.named_parameters():
             self.momentum[n] = torch.zeros_like(p)
+        self.scheduler = CosineAnnealingWarmRestarts(self.optimizer, T_0 = 10000, T_mult = 1, eta_min = self.hparams.learning_rate * 0.1)
 
+        # Init compression.
+        self.transformer = tplr.compress.TransformDCT( self.model, target_chunk = self.hparams.target_chunk )
+        self.compressor = tplr.compress.CompressDCT()
 
-        # Init AutoUpdate
-        self.autoupdate = tplr.autoupdate.AutoUpdate(
-            process_name=f"tplr_{self.uid}",
-            bucket_name=BUCKET_SECRETS["bucket_name"]
-        )
-        self.autoupdate.start()
+        # # Set checkpoint path => root dir as argumnet and pass root dir, in the init 
+        # if self.config.checkpoint_path is None:
+        #     # Default path if none provided
+        #     self.checkpoint_path = f"checkpoints/checkpoint-{self.uid}.pth"
+        # else:
+        #     self.checkpoint_path = self.config.checkpoint_path
+            
+        # # Create checkpoint directory if it doesn't exist
+        # os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
+        
 
-        # Init Checkpoint Manager
-        self.checkpoint_manager = tplr.checkpoint.CheckpointManager(
-            wallet=self.wallet,
-            model=self.model,
-            optimizer=self.optimizer,
-            checkpoint_dir="/tmp/checkpoints",
-            bucket_name=BUCKET_SECRETS["bucket_name"]
-        )
+        # # Initialize checkpoint manager
+        # self.checkpoint_manager = tplr.checkpoint.CheckpointManager(
+        #     model=self.model,
+        #     checkpoint_path=self.checkpoint_path,
+        #     wallet=self.wallet,
+        #     device=self.config.device,
+        #     optimizer=self.optimizer,
+        #     scheduler=self.scheduler
+        # )
+        
+        # # Load initial checkpoint
+        # tplr.logger.debug("Loading checkpoint...")
+        # self.global_step = asyncio.run(
+        #     self.checkpoint_manager.load_from_highest_stake(
+        #         metagraph=self.metagraph,
+        #         buckets=self.buckets,
+        #         optimizer=self.optimizer,
+        #         scheduler=self.scheduler,
+        #         is_validator=False, 
+        #         hparams=self.hparams
+        #     )
+        # )
 
-        # Load latest checkpoint if available
-        self.global_step = tplr.checkpoint.load_highest_stake_checkpoint(
-            metagraph=self.metagraph,
-            buckets=tplr.checkpoint.get_all_buckets(
-                netuid=self.config.netuid,
-                metagraph=self.metagraph,
-                config=self.config
-            ),
-            model=self.model,
-            checkpoint_path="/tmp/checkpoints/model.pt",
-            device=self.config.device,
-            optimizer=self.optimizer
-        )
-        # Init Comms Class
-        self.comms = tplr.comms.Comms(
-            bucket=...,
-            save_location='/tmp',
-            key_prefix='model',
-            subtensor=self.subtensor,
+        self.bucket = tplr.get_own_bucket()  
+
+        #  initialize ChainManager
+        self.chain_manager = tplr.chain.ChainManager(
+            config=self.config,
             netuid=self.config.netuid,
             metagraph=self.metagraph,
+            hparams=self.hparams,
+            wallet=self.wallet,
+            bucket=self.bucket,
+        )
+
+        # Get UIDs with buckets
+        uids_with_buckets = [uid for uid, bucket in self.chain_manager.commitments.items() if bucket is not None]
+        tplr.logger.info(f"uids with buckets: {uids_with_buckets}")
+
+        # Initialize peers
+                #  Inside Comms 
+        # The user should not know about bucket fuck buckets 
+        # Just pass metagraph
+        if not self.config.peers:  # If no peers specified in config
+            self.peers = list( self.metagraph.uids)  # Use all UIDs with buckets
+            tplr.logger.info(f'peers: {self.peers}')
+        else:
+            self.peers = self.config.peers  # Use specified peers
+
+        # Ensure we have at least one peer for validator mode
+        if self.config.is_validator and not self.peers:
+            tplr.logger.error("No peers available for validation. Ensure there are miners with buckets registered.")
+            sys.exit(1)
+
+        # Add self to peers if not already included
+        if self.uid not in self.peers:
+            self.peers.append(self.uid)
+
+        tplr.logger.info(f'Active peers: {self.peers}')
+
+        self.comms = tplr.comms.Comms(
+            wallet=self.wallet,
+            bucket=self.bucket,
+            chain_manager=self.chain_manager,
+            save_location='/tmp',
+            key_prefix='model',
         )
         
         # Init state params.
         self.stop_event = asyncio.Event()
         self.current_block = self.subtensor.block
-        self.current_window = int( self.current_block / BLOCKS_PER_WINDOW )
+        self.current_window = int( self.current_block / self.hparams.blocks_per_window )
         
         # Init scores.
         self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32)
         
         # Init wandb.
         if self.config.use_wandb:
-            # Delete all runs with my name and create a new one.
-            try:
-                for run in wandb.Api().runs(path=PROJECT):
-                    if run.name == f'M{self.uid}':
-                        run.delete()
-            except Exception as e:
-                tplr.logger.warning(f"Failed to delete existing run: {e}")
-            wandb.init(project=PROJECT, resume='allow', name=f'M{self.uid}', config=self.config)
+            self.wandb = tplr.wandb.WandbManager(
+                uid=self.uid,
+                config=self.config,
+                is_validator=self.config.is_validator
+            ).run
         
     # Main training loop.
     async def run( self ):
@@ -184,23 +223,28 @@ class Neuron:
             # Record the window we are on.
             step_window = self.current_window
             # Get the uid to seed data (if validator, take random from peers.)
-            step_uid = self.uid if not self.config.is_validator else random.choice(self.config.peers)
+            step_uid = self.uid if not self.config.is_validator else random.choice(self.peers)
             tplr.logger.info('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
+
+            # Checkpoint: every X windows , the validators with the highest stake will comms.put into s3, if model is None
+            # wait until until next window that % 100 == 0, just gather validator with max stake
             
-            # Optionally sync state.
-            if step_window % WINDOWS_PER_SYNC == 0:
+            # Optionally sync state. Take this out 
+            if step_window % self.hparams.windows_per_sync == 0:
                 tplr.logger.info("Sync globally")
-                gather_result = await tplr.comms.gather(
+                # This gather op is way too slow
+                # When a miner joins the the network , wait until a new checkpoint has being put up by the validator
+                gather_result = await self.comms.gather(
                     state_dict = self.model.state_dict(),
                     my_uid = self.uid,
                     uids = self.peers,
-                    window = int(self.current_window/WINDOWS_PER_SYNC),
+                    window = int(self.current_window/self.hparams.windows_per_sync),
                     key = 'model',
                     timeout = 30,
                     device = self.config.device
                 )
-                # Take median of all peers state. => mean 
-                state_dict = {name: torch.median(torch.stack(gather_result[name]), dim=0)[0] for name in gather_result}
+                # Take mean of all peers state
+                state_dict = {name: torch.mean(torch.stack(gather_result[name]), dim=0) for name in gather_result}
                 # Load state into model.
                 self.model.load_state_dict(state_dict)
                 tplr.logger.info("Done global sync.")
@@ -208,12 +252,12 @@ class Neuron:
             # Get the pages for this window.
             pages = await tplr.dataset.DatasetLoader.next_pages(
                 offset = step_window,
-                n_pages = PAGES_PER_WINDOW,
+                n_pages = self.hparams.pages_per_window,
                 seed = self.metagraph.hotkeys[ step_uid ] if not self.config.random else random.randint(10000) # Select seed from step_uid.
             )            
             loader = await tplr.dataset.DatasetLoader.create(
-                batch_size = BATCH_SIZE,
-                sequence_length = SEQUENCE_LENGTH,
+                batch_size = self.hparams.batch_size,
+                sequence_length = self.hparams.sequence_length,
                 pages_info = pages,
                 tokenizer = self.tokenizer
             )   
@@ -223,19 +267,22 @@ class Neuron:
             tplr.logger.info("Start accumulating...")
             self.optimizer.zero_grad()
             self.model.zero_grad()
-            for i, batch in enumerate( loader ):
+            total_loss = 0
+            for i, batch in enumerate(loader):
                 input_ids = torch.tensor(batch, dtype=torch.long).to(self.model.device)
                 labels = input_ids.clone()
                 labels = torch.where(labels == self.tokenizer.pad_token_id, -100, labels)
-                outputs = self.model(input_ids=input_ids, labels=labels)
+                with torch.amp.autocast(device_type=self.model.device.type, dtype=torch.bfloat16):
+                    outputs = self.model(input_ids=input_ids, labels=labels)
+                total_loss += outputs.loss.item()
                 outputs.loss.backward()
-                print ('loss:', outputs.loss.item())
+                print('loss:', outputs.loss.item())
                 if self.current_window != step_window:
                     break
-            tplr.logger.info(f"Stopped accumulating: {i+1} batches with {(i+1) * BATCH_SIZE * SEQUENCE_LENGTH} tokens ")
+            tplr.logger.info(f"Stopped accumulating: {i+1} batches with {(i+1) * self.hparams.batch_size * self.hparams.sequence_length} tokens ")
             # Log to wandb.
             if self.config.use_wandb:
-                wandb.log({"loss": outputs.loss.item()})
+                self.wandb.log({"loss": outputs.loss.item()})
                 
             # Reduce gradient using DeMo.
             gradient = {}
@@ -243,13 +290,15 @@ class Neuron:
             totalks = {}
             transmitted = {}
             for n, p in self.model.named_parameters():
+                # Step-Weight decay
+                p.data.mul_( 1.0 - self.scheduler.get_last_lr()[0] * self.hparams.weight_decay )
                 # Momentum decay
-                self.momentum[n].mul_( MOMENTUM_DECAY )
+                self.momentum[n].mul_( self.hparams.momentum_decay )
                 # Add the grad to the momentum.
-                self.momentum[n].add_( p.grad, alpha = LEARNING_RATE )
+                self.momentum[n].add_( p.grad, alpha=self.scheduler.get_last_lr()[0] )
                 # Compress gradient.
                 idxs, vals, xshape, totalk = self.compressor.compress(
-                    self.transformer.encode(self.momentum[n]), TOPK_COMPRESSION
+                    self.transformer.encode(self.momentum[n]), self.hparams.topk_compression
                 )
                 # Estimate transmitted gradient.
                 transmit_grad = self.transformer.decode(
@@ -266,7 +315,7 @@ class Neuron:
 
             # All-gather share state from all peers with timeout.
             tplr.logger.info(f"Start gather: {self.peers}")
-            gather_result = await tplr.comms.gather(
+            gather_result = await self.comms.gather(
                 state_dict = gradient,
                 my_uid = self.uid,
                 uids = self.peers,
@@ -283,7 +332,7 @@ class Neuron:
                     # Get gradient for step uid we are evaluating.
                     eval_idx = gather_result[n + 'idxs'][ self.peers.index(step_uid) ]
                     eval_val = gather_result[n + 'vals'][ self.peers.index(step_uid) ]
-                    # Decompress their gradinet.
+                    # Decompress their gradient.
                     their_grad = self.transformer.decode(
                         self.compressor.decompress(p, eval_idx, eval_val, xshapes[ n ], totalks[ n ])
                     )
@@ -292,12 +341,12 @@ class Neuron:
                     # Compute cosine sim score.
                     score = torch.nn.functional.cosine_similarity(their_grad.flatten(), my_grad.flatten(), dim=0)
                     # Compute moving scores and weights.
-                    self.scores[step_uid] = SCORES_ALPHA * score + (1 - SCORES_ALPHA) * self.scores[step_uid].expand_as(score)
+                    self.scores[step_uid] = self.hparams.scores_alpha * score + (1 - self.hparams.scores_alpha) * self.scores[step_uid].expand_as(score)
                     self.weights = torch.softmax(self.scores, dim=0)
                     # Log scores and weights to wandb.
                     if self.config.use_wandb:
                         for uid in self.peers:
-                            wandb.log({f"s{uid}": self.scores[uid], f"w{uid}": self.weights[uid] })
+                            self.wandb.log({f"s{uid}": self.scores[uid], f"w{uid}": self.weights[uid] })
                     
                 # Decompress all gradients in batch form to produce shared gradient.
                 new_grad = self.transformer.decode(
@@ -316,9 +365,9 @@ class Neuron:
             # Apply the optimizer step
             tplr.logger.info("Finish and step.")
             self.optimizer.step()
-            
+            self.scheduler.step()
             # Set weights on the chain based on current weights.
-            if self.config.is_validator and step_window % WINDOWS_PER_WEIGHTS == 0:
+            if self.config.is_validator and step_window % self.hparams.windows_per_weights == 0:
                 
                 # Set weights on chain.
                 self.subtensor.set_weights(
@@ -330,9 +379,6 @@ class Neuron:
                     wait_for_finalization = False,
                 )
                 
-            # Check for autoupdate every 360 blocks.
-            if self.current_block % 360 == 0:
-                tplr.optionally_auto_update( SPEC_VERSION )
             
             # Wait for end of window (if not already done.)
             while self.current_window == step_window:
@@ -342,8 +388,8 @@ class Neuron:
     def block_listener(self, loop):
         def handler(event, _u, _s):
             self.current_block = int(event['header']['number'])
-            if int( self.current_block / BLOCKS_PER_WINDOW ) != self.current_window:
-                self.current_window = int( self.current_block / BLOCKS_PER_WINDOW ) 
+            if int( self.current_block / self.hparams.blocks_per_window ) != self.current_window:
+                self.current_window = int( self.current_block / self.hparams.blocks_per_window ) 
         while not self.stop_event.is_set():
             try:
                 bt.subtensor(config=self.config).substrate.subscribe_block_headers(handler)

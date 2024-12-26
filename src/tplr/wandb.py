@@ -19,18 +19,36 @@
 
 # Global imports
 import os
-import wandb
+import wandb as wandbm
 
 # Local imports
 from . import __version__, logger
 
 class WandbManager:
-    def __init__(self, run_prefix=None, uid=None, config=None, group=None, job_type=None):
+    def __init__(self, run_prefix=None, uid=None, config=None, group=None, job_type=None, is_validator=False):
+        """Initialize WandB manager with proper run management and resumability.
+        
+        Args:
+            run_prefix: Optional prefix for the run name (if None, determined by is_validator)
+            uid: User ID
+            config: Config object containing wandb settings
+            group: Group name (if None, determined by is_validator)
+            job_type: Job type (if None, determined by is_validator)
+            is_validator: Boolean indicating if this is a validator run
+        """
         self.wandb_dir = os.path.join(os.getcwd(), 'wandb')
         os.makedirs(self.wandb_dir, exist_ok=True)
         self.run = None
 
-        if all(x is not None for x in [run_prefix, uid, config, group, job_type]):
+        if all(x is not None for x in [uid, config]):
+            # Set defaults based on validator status if not provided
+            if run_prefix is None:
+                run_prefix = 'V' if is_validator else 'M'
+            if group is None:
+                group = 'validator' if is_validator else 'miner'
+            if job_type is None:
+                job_type = 'validation' if is_validator else 'training'
+
             # Define the run ID file path inside the wandb directory
             run_id_file = os.path.join(
                 self.wandb_dir, f"wandb_run_id_{run_prefix}{uid}_{__version__}.txt"
@@ -44,44 +62,30 @@ class WandbManager:
                 
                 # Verify if run still exists in wandb
                 try:
-                    api = wandb.Api()
+                    api = wandbm.Api()
                     api.run(f"tplr/{config.project}-v{__version__}/{run_id}")
                     logger.info(f"Found existing run ID: {run_id}")
                 except Exception:
-                    # Run doesn't exist anymore, clear the run_id
                     logger.info(f"Previous run {run_id} not found in WandB, starting new run")
                     run_id = None
                     os.remove(run_id_file)
 
             # Initialize WandB
-            self.run = wandb.init(
+            self.run = wandbm.init(
                 project=f"{config.project}-v{__version__}",
                 entity='tplr',
                 id=run_id,
-                resume='must' if run_id else 'never',
+                resume='allow',
                 name=f'{run_prefix}{uid}',
                 config=config,
                 group=group,
                 job_type=job_type,
                 dir=self.wandb_dir,
-                settings=wandb.Settings(
+                settings=wandbm.Settings(
                     init_timeout=300,
                     _disable_stats=True,
                 )
             )
-
-            # Special handling for evaluator
-            if run_prefix == "E":
-                tasks = config.tasks.split(',')
-                for task in tasks:
-                    metric_name = f"eval/{task}"
-                    # Set up x/y plot configuration
-                    wandb.define_metric(
-                        name=metric_name,
-                        step_metric="global_step",  # This sets global_step as x-axis
-                        plot=True,  # Ensure it creates a line plot
-                        summary="max"
-                    )
 
             # Save run ID for future resumption
             if not run_id:

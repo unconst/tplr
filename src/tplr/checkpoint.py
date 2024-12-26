@@ -11,10 +11,9 @@ from aiobotocore.session import get_session
 from tqdm import tqdm
 from . import __version__
 from .config import BUCKET_SECRETS, client_config
-from .constants import CF_REGION_NAME
+from .comms import CF_REGION_NAME
 from .logging import logger
 from .schemas import Bucket
-from .chain import get_commitments
 
 
 def get_base_url(account_id: str) -> str:
