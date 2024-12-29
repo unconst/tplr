@@ -16,25 +16,33 @@
 # DEALINGS IN THE SOFTWARE.
 # fmt: off
 
-# Global imports.
+# Standard library
+import sys
 import time
-import torch
 import random
 import asyncio
 import argparse
 import threading
-import numpy as np
-import bittensor as bt
-import torch.optim as optim
-from transformers import LlamaForCausalLM
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
-import sys
+from typing import Dict
+import os
 
-# Import local package.
+# Third party
+import numpy as np
+import torch
+import bittensor as bt
+from torch.optim import SGD
+from transformers import LlamaForCausalLM
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    LinearLR,
+    SequentialLR,
+)
+
+# Local
 import tplr
 
-# GPU optimizations.
-# Set seeds for reproducibility
+
+# GPU optimizations
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 np.random.seed(42)
@@ -44,6 +52,7 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+
 class Miner:
     
     # Command line config items.
@@ -52,18 +61,19 @@ class Miner:
         parser = argparse.ArgumentParser(description='Miner script')
         parser.add_argument('--netuid', type=int, default=268, help='Bittensor network UID.')
         parser.add_argument('--project', type=str, default='llama-demo', help='Wandb project.')
-        parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
+        parser.add_argument('--device', type=str, default='cuda', help='Device to use for training')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
         parser.add_argument('--trace', action='store_true', help='Enable trace logging')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
-        parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with. e.g., --uids 1 2 3')
-        parser.add_argument('--uid', type=int, default=229, help='This Peer uid.')
-        bt.subtensor.add_args( parser )
-        bt.logging.add_args( parser )
+        parser.add_argument('--peers', type=int, nargs='+', default=[], help='List of UIDs to peer with')
+        bt.subtensor.add_args(parser)
+        bt.logging.add_args(parser)
         bt.wallet.add_args(parser)
         config = bt.config(parser)
-        if config.debug: tplr.debug()
-        if config.trace: tplr.trace()
+        if config.debug:
+            tplr.debug()
+        if config.trace:
+            tplr.trace()
         return config
     
     def __init__(self):
@@ -87,33 +97,33 @@ class Miner:
         self.model.to(self.config.device)
         self.tokenizer = self.hparams.tokenizer
         
-        # Init optimizer and scheduler
+        # Init optimizer and momentum
+        self.optimizer = SGD(self.model.parameters(), lr=self.hparams.learning_rate)
         self.momentum = {}
-        self.optimizer = optim.SGD(self.model.parameters(), lr=self.hparams.learning_rate)
         for n, p in self.model.named_parameters():
             self.momentum[n] = torch.zeros_like(p)
         
-        # Original scheduler setup
+        # Set up scheduler
         warmup_scheduler = LinearLR(
             self.optimizer,
-            total_iters=250      # Warm up over 250 steps
+            total_iters=250,
         )
         cosine_scheduler = CosineAnnealingWarmRestarts(
             self.optimizer,
             T_0=10000,
             T_mult=1,
-            eta_min=self.hparams.learning_rate * 0.1
+            eta_min=self.hparams.learning_rate * 0.1,
         )
         self.scheduler = SequentialLR(
             self.optimizer,
             schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[250]
+            milestones=[250],
         )
 
         # Init compression
         self.transformer = tplr.compress.TransformDCT(
-            self.model, 
-            target_chunk=self.hparams.target_chunk
+            self.model,
+            target_chunk=self.hparams.target_chunk,
         )
         self.compressor = tplr.compress.CompressDCT()
 
@@ -121,7 +131,7 @@ class Miner:
         self.comms = tplr.comms.Comms(
             wallet=self.wallet,
             save_location='/tmp',
-            key_prefix='model', 
+            key_prefix='model',
             config=self.config,
             netuid=self.config.netuid,
             metagraph=self.metagraph,
@@ -147,22 +157,42 @@ class Miner:
             self.wandb = tplr.WandbManager(
                 uid=self.uid,
                 config=self.config,
-                is_validator=False
+                is_validator=False,
             ).run
 
     # Main training loop.
-    async def run( self ):
+    async def run(self):
+        # Try to load latest checkpoint
+        validator_uid, stake = self.comms.get_highest_stake_validator()
+        if stake > 0:
+            try:
+                state_dict = await self.comms.get(
+                    uid=str(validator_uid),
+                    window=self.current_window,
+                    key='checkpoint',
+                    timeout=240
+                )
+                if state_dict is not None:
+                    self.model.load_state_dict(state_dict)
+                    tplr.logger.info(f"Loaded checkpoint from validator {validator_uid} at window {self.current_window}")
+                else:
+                    tplr.logger.info("No checkpoint found, starting from scratch")
+            except Exception as e:
+                tplr.logger.warning(f"Failed to load checkpoint: {e}")
+        else:
+            tplr.logger.info("No active validators found, starting from scratch")
 
-        # Start background block listener.       
+        # Start background block listener
         self.loop = asyncio.get_running_loop()
-        self.listener = threading.Thread(target=self.block_listener, args=(self.loop,), daemon=True).start()
+        self.listener = threading.Thread(
+            target=self.block_listener,
+            args=(self.loop,),
+            daemon=True,
+        ).start()
 
-        # Run until stopped.
         while True:
-            
-            # Record the window we are on.
             step_window = self.current_window
-            print('\n' + '-' * 40 + f' Window: {step_window} ' + '-' * 40)
+            tplr.logger.info(f"\n{'-' * 40} Window: {step_window} {'-' * 40}")
 
             # Get the pages for this window.
             pages = await tplr.dataset.DatasetLoader.next_pages(
@@ -176,7 +206,7 @@ class Miner:
                 pages_info = pages,
                 tokenizer = self.tokenizer
             )   
-            print(f"Pages: {[p[1] for p in pages]} for UID: {self.config.uid} and Window: {step_window}")
+            tplr.logger.info(f"Pages: {[p[1] for p in pages]} for UID: {self.config.uid} and Window: {step_window}")
             
             # Accumulate gradient.
             start_time = time.time()
@@ -205,7 +235,7 @@ class Miner:
                     "loss": total_loss/(i+1),
                     "tokens_per_sec": ((i+1) * self.hparams.batch_size * self.hparams.sequence_length)/duration
                 })
-                
+            
             # Reduce gradient using DeMo.
             gradient = {}
             xshapes = {}
@@ -264,7 +294,7 @@ class Miner:
                     p.grad.copy_(new_grad)
                 # Sign-SGD
                 p.grad.sign_()
-                    
+                
             # Apply optimizer step
             tplr.logger.info("Finish and step.")
             self.optimizer.step()
@@ -281,14 +311,15 @@ class Miner:
     def block_listener(self, loop):
         def handler(event, _u, _s):
             self.current_block = int(event['header']['number'])
-            if int( self.current_block / self.hparams.blocks_per_window ) != self.current_window:
-                self.current_window = int( self.current_block / self.hparams.blocks_per_window ) 
+            if int(self.current_block / self.hparams.blocks_per_window) != self.current_window:
+                self.current_window = int(self.current_block / self.hparams.blocks_per_window)
         while not self.stop_event.is_set():
             try:
-                bt.subtensor(config=self.config).substrate.subscribe_block_headers(handler); break
-            except Exception as e:
-                time.sleep(1) 
+                bt.subtensor(config=self.config).substrate.subscribe_block_headers(handler)
+                break
+            except Exception:
+                time.sleep(1)
 
 # Start miner/validator.
 if __name__ == "__main__":
-    asyncio.run( Miner().run() )
+    asyncio.run(Miner().run())

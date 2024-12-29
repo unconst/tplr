@@ -16,21 +16,28 @@
 # DEALINGS IN THE SOFTWARE.
 # fmt: off
 
-# Global imports.
+# Standard library
 import sys
 import time
-import torch
 import random
 import asyncio
 import argparse
 import threading
-import numpy as np
-import bittensor as bt
-import torch.optim as optim
-from transformers import LlamaForCausalLM
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+import os
 
-# Import local package.
+# Third party
+import numpy as np
+import torch
+import bittensor as bt
+from torch.optim import SGD
+from transformers import LlamaForCausalLM
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    LinearLR,
+    SequentialLR,
+)
+
+# Local
 import tplr
 
 # GPU optimizations.
@@ -58,8 +65,10 @@ class Validator:
         bt.logging.add_args(parser)
         bt.wallet.add_args(parser)
         config = bt.config(parser)
-        if config.debug: tplr.debug()
-        if config.trace: tplr.trace()
+        if config.debug:
+            tplr.debug()
+        if config.trace:
+            tplr.trace()
         return config
     
     def __init__(self):
@@ -91,7 +100,7 @@ class Validator:
         self.compressor = tplr.compress.CompressDCT()
         
         # Init optimizer and momentum
-        self.optimizer = optim.SGD(self.model.parameters(), lr=self.hparams.learning_rate)
+        self.optimizer = SGD(self.model.parameters(), lr=self.hparams.learning_rate)
         self.momentum = {}
         self.xshapes = {}
         self.totalks = {}
@@ -145,6 +154,9 @@ class Validator:
         self.current_window = int(self.current_block / self.hparams.blocks_per_window)
         self.sync_window = self.current_window
 
+        # Init scores
+        self.scores = torch.zeros(self.metagraph.n, dtype=torch.float32)
+
         # Init wandb
         if self.config.use_wandb:
             self.wandb = tplr.WandbManager(
@@ -154,6 +166,25 @@ class Validator:
             ).run
 
     async def run(self):
+        # Try to load latest checkpoint
+        validator_uid, stake = self.comms.get_highest_stake_validator()
+        if stake > 0:
+            try:
+                state_dict = await self.comms.get(
+                    uid=str(validator_uid),
+                    window=self.current_window,
+                    key='checkpoint',
+                    timeout=240
+                )
+                if state_dict is not None:
+                    self.model.load_state_dict(state_dict)
+                    tplr.logger.info(f"Loaded checkpoint from validator {validator_uid} at window {self.current_window}")
+                else:
+                    tplr.logger.info("No checkpoint found, starting from scratch")
+            except Exception as e:
+                tplr.logger.warning(f"Failed to load checkpoint: {e}")
+        else:
+            tplr.logger.info("No active validators found, starting from scratch")
         # Start block listener
         self.loop = asyncio.get_running_loop()
         self.listener = threading.Thread(
@@ -167,6 +198,22 @@ class Validator:
             while self.sync_window >= (self.current_window - self.hparams.validator_offset):
                 tplr.logger.info(f'Waiting for validator window offset, synced: {self.sync_window}, current:{self.current_window}, offset:{self.hparams.validator_offset}')
                 await asyncio.sleep(12)
+
+            # Check if checkpointing is needed (every 500 windows)
+            if self.current_window % 500 == 0:
+                tplr.logger.info(f'Creating checkpoint at window {self.current_window}')
+                
+                try:
+                    # Upload the model state directly using put
+                    await self.comms.put(
+                        state_dict_or_path=self.model.state_dict(),
+                        uid=self.uid,
+                        window_or_block=self.current_window,
+                        key='checkpoint'
+                    )
+                    tplr.logger.info(f"Successfully created checkpoint at window {self.current_window}")
+                except Exception as e:
+                    tplr.logger.error(f"Failed to create checkpoint: {e}")
 
             # Catch up to current - validator_offset
             while self.sync_window < (self.current_window - self.hparams.validator_offset):
